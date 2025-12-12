@@ -1,3 +1,5 @@
+tokenizer/
+
 *.txt
 *.jsonl
 *json
