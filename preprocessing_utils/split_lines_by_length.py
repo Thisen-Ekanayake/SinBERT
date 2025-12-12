@@ -77,5 +77,5 @@ def split_lines_by_word_count(input_file: str):
 # === MAIN EXECUTION ===
 # Replace with your actual file path
 if __name__ == "__main__":
-    file_path = "add_file_path_(file_should_be_in_.txt_format)"
+    file_path = "output_path.normalized.txt"
     split_lines_by_word_count(file_path)

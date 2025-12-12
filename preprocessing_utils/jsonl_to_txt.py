@@ -26,4 +26,4 @@ def jsonl_to_txt(jsonl_path, txt_path):
                 print("Skipping line due to error:", e)
 
 if __name__ == "__main__":
-    jsonl_to_txt("si_clean_0000.jsonl", "output.txt")
+    jsonl_to_txt("output_1.jsonl", "output_1.txt")

@@ -3,8 +3,8 @@ combine 2 text files into one
 """
 
 # ==== CONFIG ====
-file1_path = "main_5856427_116349202.txt"
-file2_path = "long_filtered.txt"
+file1_path = "combined_1.txt"
+file2_path = "combined_2.txt"
 output_path = "combined.txt"
 # ==================
 
