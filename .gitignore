@@ -5,3 +5,5 @@ tokenizer/
 *.jsonl
 *json
 *.parquet
+
+!requirements.txt
