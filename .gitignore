@@ -3,7 +3,6 @@ tokenizer/
 bert_checkpoints/
 bert_final_model/
 data/
-preprocessing_utils/
 text_shards/
 tokenized_chunks/
 
