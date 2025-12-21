@@ -8,10 +8,80 @@ from transformers import (
     BertForMaskedLM,
     Trainer,
     TrainingArguments,
+    TrainerCallback,
     DataCollatorForLanguageModeling
 )
 import sentencepiece as spm
 import wandb
+import pynvml
+import time
+
+# ==================== POWER CONSUMPTION LOGGING ====================
+pynvml.nvmlInit()
+GPU_HANDLE = pynvml.nvmlDeviceGetHandleByIndex(0)
+
+class GPUEfficiencyCallback(TrainerCallback):
+    def __init__(self, log_every_n_steps=10):
+        self.log_every_n_steps = log_every_n_steps
+        self.energy_joules = 0.0
+        self.total_tokens = 0
+        self.last_time = None
+
+    def on_step_begin(self, args, state, control, **kwargs):
+        if self.last_time is None:
+            self.last_time = time.time()
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if state.global_step % self.log_every_n_steps != 0:
+            return
+
+        now = time.time()
+        dt = now - self.last_time
+        self.last_time = now
+
+        # GPU telemetry
+        power_watts = pynvml.nvmlDeviceGetPowerUsage(GPU_HANDLE) / 1000.0
+        util = pynvml.nvmlDeviceGetUtilizationRates(GPU_HANDLE).gpu
+        temp = pynvml.nvmlDeviceGetTemperature(
+            GPU_HANDLE, pynvml.NVML_TEMPERATURE_GPU
+        )
+
+        # Energy integration
+        self.energy_joules += power_watts * dt
+        energy_wh = self.energy_joules / 3600.0
+
+        # Token counting
+        batch = kwargs.get("inputs", None)
+        if batch is not None and "input_ids" in batch:
+            tokens_this_step = batch["input_ids"].numel()
+            self.total_tokens += tokens_this_step
+        else:
+            tokens_this_step = 0
+
+        # Efficiency metrics
+        watts_per_token = (
+            power_watts / tokens_this_step if tokens_this_step > 0 else 0.0
+        )
+        joules_per_token = (
+            self.energy_joules / self.total_tokens
+            if self.total_tokens > 0
+            else 0.0
+        )
+
+        # Log to W&B
+        wandb.log(
+            {
+                "gpu/power_watts": power_watts,
+                "gpu/energy_wh": energy_wh,
+                "gpu/utilization_pct": util,
+                "gpu/temperature_c": temp,
+                "train/tokens_step": tokens_this_step,
+                "train/tokens_total": self.total_tokens,
+                "efficiency/watts_per_token": watts_per_token,
+                "efficiency/joules_per_token": joules_per_token,
+            },
+            step=state.global_step,
+        )
 
 
 
@@ -75,7 +145,7 @@ class BertChunkDataset(Dataset):
         }
 
 # Initialize dataset with a limit for testing
-dataset = BertChunkDataset(CHUNK_DIR, max_files=10)  # Start with 20 files
+dataset = BertChunkDataset(CHUNK_DIR)  # Start with 20 files max_files=10
 
 
 
@@ -209,11 +279,11 @@ else:
 if wandb.run is None:
     run = wandb.init(
         project="bert-finetuning",
-        name="bert_lr3e-4_bs128_cosine",
+        name="bert_lr1e-5_bs128_cosine_whole_dataset",
         id=wandb_run_id,           # Use existing run ID if available
         resume="allow",             # Allow resuming
         config={
-            "lr": 3e-4,
+            "lr": 1e-5,
             "effective_batch_size": 16 * 8,
             "scheduler": "cosine",
             "epochs": 2,
@@ -238,7 +308,7 @@ training_args = TrainingArguments(
     gradient_accumulation_steps=8,    # Effective batch = 128
     
     # Learning rate
-    learning_rate=1e-4,  # Lower learning rate for BERT
+    learning_rate=1e-5,  # Lower learning rate for BERT
     warmup_ratio=0.05,
     # warmup_steps=5000,
     weight_decay=0.01,
@@ -249,8 +319,8 @@ training_args = TrainingArguments(
     
     # Checkpointing
     logging_steps=100,
-    eval_steps=500,  # Added evaluation steps
-    save_steps=500,
+    eval_steps=25000,  # Added evaluation steps
+    save_steps=2000,
     save_total_limit=3,
     
     # Evaluation
@@ -282,6 +352,7 @@ trainer = Trainer(
     data_collator=data_collator,
     # Optional: compute metrics if needed
     # compute_metrics=compute_metrics,
+    callbacks=[GPUEfficiencyCallback(log_every_n_steps=10)]
 )
 
 print("✓ Trainer ready with train/validation split")
