@@ -75,7 +75,7 @@ class BertChunkDataset(Dataset):
         }
 
 # Initialize dataset with a limit for testing
-dataset = BertChunkDataset(CHUNK_DIR)  # Start with 20 files max_files=10
+dataset = BertChunkDataset(CHUNK_DIR, max_files=800)  # Start with 20 files max_files=10
 
 
 
@@ -209,12 +209,12 @@ else:
 if wandb.run is None:
     run = wandb.init(
         project="bert-pretraining",
-        name="bert_lr1e-5_bs128_cosine",
+        name="bert_lr1e-4_bs256_cosine",
         id=wandb_run_id,           # Use existing run ID if available
         resume="allow",             # Allow resuming
         config={
-            "lr": 1e-5,
-            "effective_batch_size": 16 * 8,
+            "lr": 1e-4,
+            "effective_batch_size": 32 * 8,
             "scheduler": "cosine",
             "epochs": 2,
         }
@@ -233,12 +233,12 @@ training_args = TrainingArguments(
     overwrite_output_dir=False, # set to false to start from existing checkpoints
     
     # Batch sizes
-    per_device_train_batch_size=16,  # Reduced for stability
-    per_device_eval_batch_size=32,
+    per_device_train_batch_size=32,  # Reduced for stability
+    per_device_eval_batch_size=64,
     gradient_accumulation_steps=8,    # Effective batch = 128
     
     # Learning rate
-    learning_rate=1e-5,  # Lower learning rate for BERT
+    learning_rate=1e-4,  # Lower learning rate for BERT
     warmup_ratio=0.05,
     # warmup_steps=5000,
     weight_decay=0.01,
@@ -249,7 +249,7 @@ training_args = TrainingArguments(
     
     # Checkpointing
     logging_steps=100,
-    eval_steps=25000,  # Added evaluation steps
+    eval_steps=7500,  # Added evaluation steps
     save_steps=2000,
     save_total_limit=3,
     
