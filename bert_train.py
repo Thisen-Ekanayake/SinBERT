@@ -336,6 +336,8 @@ config = BertConfig.from_json_file(CONFIG_FILE)
 
 # Wire SentencePiece native IDs into HuggingFace BertConfig
 config.pad_token_id  = PAD_ID   # 0  → <pad>
+config.bos_token_id  = BOS_ID   # 2  → <s>    (used by model internals for loss masking)
+config.eos_token_id  = EOS_ID   # 3  → </s>   (used by model internals for loss masking)
 config.cls_token_id  = BOS_ID   # 2  → <s>
 config.sep_token_id  = EOS_ID   # 3  → </s>
 config.mask_token_id = MASK_ID  # 4  → [MASK]
