@@ -397,7 +397,7 @@ if wandb.run is None:
             "max_seq_len":        512,
             "mlm_probability":    0.15,
             "learning_rate":      1e-4,
-            "effective_batch":    128 * 2,
+            "effective_batch":    256,
             "warmup_ratio":       0.10,
             "scheduler":          "cosine",
             "epochs":             3,
@@ -418,9 +418,12 @@ training_args = TrainingArguments(
     output_dir=CHECKPOINT_DIR,
 
     # Batch — MI300X has 192GB HBM3, push it hard
-    per_device_train_batch_size=128,
+    # gradient_accumulation_steps=1 so the Trainer logs loss/step correctly.
+    # With accumulation > 1, HF Trainer logs the *sum* across micro-steps,
+    # doubling the displayed loss even though training is fine.
+    per_device_train_batch_size=256,
     per_device_eval_batch_size=256,
-    gradient_accumulation_steps=2,      # effective batch = 256
+    gradient_accumulation_steps=1,      # effective batch = 256
 
     # Learning rate
     learning_rate=1e-4,
