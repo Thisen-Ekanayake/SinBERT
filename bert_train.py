@@ -22,7 +22,6 @@ CHECKPOINT_DIR     = "bert_checkpoints"
 FINAL_MODEL_DIR    = "bert_final_model"
 WANDB_RUN_ID_FILE  = "wandb_run_id.txt"
 
-CACHE_FILES        = 10        # max .pt files held in memory at once
 MAX_FILES          = None      # set to int to cap dataset size for testing
 TRAIN_RATIO        = 0.9
 
@@ -47,39 +46,30 @@ print(f"PAD_ID     : {PAD_ID}")
 print(f"MASK_ID    : {MASK_ID}")
 
 
-# ── Dataset (lazy loading with LRU file cache) ─────────────────────────────────
+# ── Dataset (full in-memory) ───────────────────────────────────────────────────
+# Load everything into RAM up front. With 4.3M samples at 512 tokens each
+# this is ~35GB — well within the MI300X's 192GB HBM. Workers can then serve
+# batches from RAM with zero disk I/O, keeping the GPU fully fed.
 class BertChunkDataset(Dataset):
     def __init__(self, chunk_dir, max_files=None):
-        self.files = sorted(glob.glob(f"{chunk_dir}/*.pt"))
+        files = sorted(glob.glob(f"{chunk_dir}/*.pt"))
         if max_files:
-            self.files = self.files[:max_files]
-        assert len(self.files) > 0, f"No .pt files found in {chunk_dir}"
+            files = files[:max_files]
+        assert len(files) > 0, f"No .pt files found in {chunk_dir}"
 
-        # Build index without loading all data into RAM
-        print(f"Indexing {len(self.files)} files...")
-        self.index = []   # list of (file_idx, sample_idx)
-        for file_idx, path in enumerate(tqdm(self.files, desc="Indexing")):
-            data = torch.load(path, weights_only=True)
-            self.index.extend((file_idx, i) for i in range(len(data)))
+        self.data = []
+        print(f"Loading {len(files)} files into memory...")
+        for path in tqdm(files, desc="Loading"):
+            self.data.extend(torch.load(path, weights_only=True))
 
-        random.shuffle(self.index)
-        self._cache = {}   # file_idx → list[dict]
-        print(f"✓ Dataset indexed: {len(self.index):,} samples across {len(self.files)} files")
-
-    def _load(self, file_idx):
-        if file_idx not in self._cache:
-            # Evict oldest entry if cache is full
-            if len(self._cache) >= CACHE_FILES:
-                self._cache.pop(next(iter(self._cache)))
-            self._cache[file_idx] = torch.load(self.files[file_idx], weights_only=True)
-        return self._cache[file_idx]
+        random.shuffle(self.data)
+        print(f"✓ Loaded {len(self.data):,} samples across {len(files)} files")
 
     def __len__(self):
-        return len(self.index)
+        return len(self.data)
 
     def __getitem__(self, idx):
-        file_idx, sample_idx = self.index[idx]
-        item = self._load(file_idx)[sample_idx]
+        item = self.data[idx]
         return {
             "input_ids":      item["input_ids"],
             "attention_mask": item["attention_mask"],
@@ -263,8 +253,10 @@ training_args = TrainingArguments(
     load_best_model_at_end=False,
     metric_for_best_model="eval_loss",
 
-    # I/O
-    dataloader_num_workers=8,
+    # I/O — data is in RAM so workers only add overhead; pin_memory speeds
+    # up CPU→GPU transfers via page-locked memory
+    dataloader_num_workers=0,
+    dataloader_pin_memory=True,
 
     # Reporting
     report_to="wandb",
