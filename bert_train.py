@@ -233,7 +233,6 @@ if wandb.run is None:
 # ── Training Arguments ────────────────────────────────────────────────────────
 training_args = TrainingArguments(
     output_dir=CHECKPOINT_DIR,
-    overwrite_output_dir=False,
 
     # Batch — MI300X has 192GB HBM3, push it hard
     per_device_train_batch_size=128,
@@ -257,7 +256,7 @@ training_args = TrainingArguments(
     logging_steps=100,
     save_steps=2000,
     save_total_limit=3,
-    eval_steps=5000,
+    eval_steps=2000,
     eval_strategy="steps",
 
     # Disable best-model loading so checkpointing plays nicely with resume
