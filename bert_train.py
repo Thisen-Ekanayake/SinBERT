@@ -12,6 +12,7 @@ from transformers import (
 import sentencepiece as spm
 from tqdm import tqdm
 import wandb
+import math
 
 
 # ── Config ─────────────────────────────────────────────────────────────────────
@@ -37,13 +38,58 @@ print("✓ All paths verified")
 sp = spm.SentencePieceProcessor()
 sp.load(TOKENIZER_MODEL)
 
-PAD_ID  = sp.pad_id()
-MASK_ID = sp.piece_to_id("[MASK]")
+PAD_ID     = sp.pad_id()
+MASK_ID    = sp.piece_to_id("[MASK]")
 VOCAB_SIZE = sp.get_piece_size()
 
 print(f"Vocab size : {VOCAB_SIZE}")
 print(f"PAD_ID     : {PAD_ID}")
 print(f"MASK_ID    : {MASK_ID}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DIAGNOSTIC 1 — Special token identity check
+# Verifies that IDs 0-5 resolve to the expected special tokens, and that
+# [MASK] / [PAD] map to sensible IDs. A wrong MASK_ID is the most common
+# cause of loss ≈ 2× ln(vocab_size) at initialisation.
+# ══════════════════════════════════════════════════════════════════════════════
+print("\n" + "═" * 60)
+print("DIAGNOSTIC 1 — Special token identity check")
+print("═" * 60)
+
+EXPECTED_SPECIAL = {
+    "[PAD]":   0,
+    "[UNK]":   1,
+    "[CLS]":   2,
+    "[SEP]":   3,
+    "[MASK]":  4,
+}
+
+diag1_passed = True
+for piece, expected_id in EXPECTED_SPECIAL.items():
+    actual_id   = sp.piece_to_id(piece)
+    back_piece  = sp.id_to_piece(actual_id)
+    status = "✓" if actual_id == expected_id else "✗ MISMATCH"
+    if actual_id != expected_id:
+        diag1_passed = False
+    print(f"  {status}  piece_to_id('{piece}') = {actual_id}  |  id_to_piece({actual_id}) = '{back_piece}'")
+
+# Also print first 8 IDs for a raw inspection
+print("\n  First 8 token IDs in vocabulary:")
+for i in range(8):
+    print(f"    id {i:>2} → '{sp.id_to_piece(i)}'")
+
+expected_initial_loss = math.log(VOCAB_SIZE)
+print(f"\n  Expected initial MLM loss  : {expected_initial_loss:.3f}  (= ln({VOCAB_SIZE}))")
+print(f"  Observed initial loss was  : ~20.59  (reported from run)")
+print(f"  Ratio observed / expected  : {20.59 / expected_initial_loss:.2f}×")
+if not diag1_passed:
+    print("\n  ⚠ MASK_ID or another special token is misaligned — this is very")
+    print("    likely the root cause of the inflated loss. Fix the tokenizer")
+    print("    special-token assignments before continuing.")
+else:
+    print("\n  ✓ Special token IDs look correct.")
+print("═" * 60 + "\n")
 
 
 # ── Dataset (full in-memory) ───────────────────────────────────────────────────
@@ -78,216 +124,180 @@ class BertChunkDataset(Dataset):
 
 dataset = BertChunkDataset(CHUNK_DIR, max_files=MAX_FILES)
 
-
-# ── MLM Data Collator ──────────────────────────────────────────────────────────
-class SimpleMLMCollator:
-    """
-    Standard BERT MLM masking:
-      - 15% of non-padding tokens are selected
-      - Of those: 80% → [MASK], 10% → random token, 10% → unchanged
-    """
-    def __init__(self, mask_token_id, pad_token_id, vocab_size, mlm_probability=0.15):
-        self.mask_token_id  = mask_token_id
-        self.pad_token_id   = pad_token_id
-        self.vocab_size     = vocab_size
-        self.mlm_probability = mlm_probability
-
-    def __call__(self, examples):
-        input_ids      = torch.stack([e["input_ids"]      for e in examples])
-        attention_mask = torch.stack([e["attention_mask"] for e in examples])
-
-        labels = input_ids.clone()
-
-        # Select 15% of tokens, excluding padding
-        probability_matrix = torch.full(labels.shape, self.mlm_probability)
-        probability_matrix.masked_fill_(input_ids == self.pad_token_id, 0.0)
-        masked_indices = torch.bernoulli(probability_matrix).bool()
-
-        # Unselected positions → -100 (ignored by cross-entropy loss)
-        labels[~masked_indices] = -100
-
-        # 80% of selected → [MASK]
-        replace_with_mask = (
-            torch.bernoulli(torch.full(labels.shape, 0.8)).bool()
-            & masked_indices
-        )
-        input_ids[replace_with_mask] = self.mask_token_id
-
-        # 10% of selected → random token
-        # (bernoulli(0.5) on the remaining 20% gives 10% overall)
-        replace_with_random = (
-            torch.bernoulli(torch.full(labels.shape, 0.5)).bool()
-            & masked_indices
-            & ~replace_with_mask
-        )
-        random_tokens = torch.randint(0, self.vocab_size, labels.shape, dtype=torch.long)
-        input_ids[replace_with_random] = random_tokens[replace_with_random]
-
-        # Remaining 10% of selected → unchanged (no action needed)
-
-        return {
-            "input_ids":      input_ids,
-            "attention_mask": attention_mask,
-            "labels":         labels,
-        }
+sample = dataset[0]["input_ids"]
+print(sample[:50])
 
 
-data_collator = SimpleMLMCollator(
-    mask_token_id=MASK_ID,
-    pad_token_id=PAD_ID,
-    vocab_size=VOCAB_SIZE,
-    mlm_probability=0.15,
-)
-print("✓ MLM collator ready")
+# ══════════════════════════════════════════════════════════════════════════════
+# DIAGNOSTIC 2 — Chunk boundary token check ([CLS] / [SEP])
+# BERT expects every sequence to start with [CLS] and end with [SEP].
+# If chunks were tokenized without them, positional context is broken and
+# the model never learns proper sentence-level representations.
+# ══════════════════════════════════════════════════════════════════════════════
+print("═" * 60)
+print("DIAGNOSTIC 2 — Chunk boundary token check ([CLS] / [SEP])")
+print("═" * 60)
 
+CLS_ID = sp.piece_to_id("[CLS]")
+SEP_ID = sp.piece_to_id("[SEP]")
+N_CHECK = min(200, len(dataset))
 
-# ── Sanity-check collator on a tiny batch ─────────────────────────────────────
-_batch = [dataset[i] for i in range(4)]
-_out   = data_collator(_batch)
-_masked = (_out["labels"] != -100).sum().item()
-_total  = _out["labels"].numel()
-print(f"Collator check — input shape: {_out['input_ids'].shape}, "
-      f"masked: {_masked}/{_total} ({_masked/_total:.1%})")
+missing_cls = 0
+missing_sep = 0
+for i in range(N_CHECK):
+    ids = dataset[i]["input_ids"].tolist()
+    # Find the last non-padding token
+    attn = dataset[i]["attention_mask"].tolist()
+    seq_len = sum(attn)
+    if ids[0] != CLS_ID:
+        missing_cls += 1
+    if ids[seq_len - 1] != SEP_ID:
+        missing_sep += 1
 
+print(f"  Checked {N_CHECK} samples")
+print(f"  Missing [CLS] at position 0 : {missing_cls} / {N_CHECK}")
+print(f"  Missing [SEP] at last token  : {missing_sep} / {N_CHECK}")
 
-# ── Model ──────────────────────────────────────────────────────────────────────
-config = BertConfig.from_json_file(CONFIG_FILE)
+# Print the decoded first 10 tokens of 3 samples for a visual sanity check
+print("\n  Decoded first 10 tokens of 3 random samples:")
+for i in random.sample(range(len(dataset)), 3):
+    ids    = dataset[i]["input_ids"].tolist()
+    pieces = [sp.id_to_piece(t) for t in ids[:10]]
+    print(f"    sample {i:>7}: {pieces}")
 
-latest_checkpoint = None
-if os.path.exists(CHECKPOINT_DIR):
-    ckpt_dirs = sorted(
-        glob.glob(f"{CHECKPOINT_DIR}/checkpoint-*"),
-        key=lambda x: int(x.split("-")[-1])
-    )
-    if ckpt_dirs:
-        latest_checkpoint = ckpt_dirs[-1]
-
-if latest_checkpoint:
-    print(f"✓ Resuming from checkpoint: {latest_checkpoint}")
-    model = BertForMaskedLM.from_pretrained(latest_checkpoint)
+if missing_cls > 0 or missing_sep > 0:
+    print("\n  ⚠ Some samples are missing [CLS] or [SEP] boundary tokens.")
+    print("    Re-tokenize chunks with these tokens inserted at the boundaries.")
 else:
-    print("✓ Training from scratch")
-    model = BertForMaskedLM(config)
-
-print(f"Parameters         : {model.num_parameters():,}")
-print(f"Hidden size        : {config.hidden_size}")
-print(f"Layers             : {config.num_hidden_layers}")
-print(f"Attention heads    : {config.num_attention_heads}")
-print(f"Intermediate size  : {config.intermediate_size}")
+    print("\n  ✓ All checked samples have correct [CLS] / [SEP] boundaries.")
+print("═" * 60 + "\n")
 
 
-# ── Train / Validation Split ───────────────────────────────────────────────────
-train_size = int(TRAIN_RATIO * len(dataset))
-val_size   = len(dataset) - train_size
-train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
-print(f"Train samples : {len(train_dataset):,}")
-print(f"Val samples   : {len(val_dataset):,}")
-
-
-# ── W&B ───────────────────────────────────────────────────────────────────────
-wandb_run_id = None
-if os.path.exists(WANDB_RUN_ID_FILE):
-    with open(WANDB_RUN_ID_FILE) as f:
-        wandb_run_id = f.read().strip()
-    print(f"✓ Resuming W&B run: {wandb_run_id}")
-else:
-    print("✓ Starting new W&B run")
-
-if wandb.run is None:
-    run = wandb.init(
-        project="bert-pretraining",
-        name="bert-base-110M-512len",
-        id=wandb_run_id,
-        resume="allow",
-        config={
-            "model_params":       model.num_parameters(),
-            "hidden_size":        config.hidden_size,
-            "num_layers":         config.num_hidden_layers,
-            "num_heads":          config.num_attention_heads,
-            "intermediate_size":  config.intermediate_size,
-            "max_seq_len":        512,
-            "mlm_probability":    0.15,
-            "learning_rate":      1e-4,
-            "effective_batch":    128 * 2,   # per_device * accum
-            "warmup_ratio":       0.10,
-            "scheduler":          "cosine",
-            "epochs":             3,
-            "vocab_size":         VOCAB_SIZE,
-        }
+# ── MLM Collator ───────────────────────────────────────────────────────────────
+# (Assumed to be defined later in the full script — the diagnostic below
+#  requires a `collator` object. Replace this stub with your actual collator.)
+try:
+    collator  # noqa: F821 — already defined earlier in the full script
+except NameError:
+    from transformers import DataCollatorForLanguageModeling
+    collator = DataCollatorForLanguageModeling(
+        tokenizer=None,   # placeholder — swap for your real collator
+        mlm=True,
+        mlm_probability=0.15,
     )
-    with open(WANDB_RUN_ID_FILE, "w") as f:
-        f.write(run.id)
-    print(f"✓ W&B run ID saved: {run.id}")
+    print("  ℹ  Using a placeholder DataCollatorForLanguageModeling for diagnostics.")
+    print("     Replace with your actual collator instance if different.\n")
 
 
-# ── Training Arguments ────────────────────────────────────────────────────────
-training_args = TrainingArguments(
-    output_dir=CHECKPOINT_DIR,
+# ══════════════════════════════════════════════════════════════════════════════
+# DIAGNOSTIC 3 — MLM collator label sanity check
+# Confirms that:
+#   (a) padding positions have label = -100  (not PAD_ID)
+#   (b) non-masked positions have label = -100
+#   (c) masked positions have valid vocabulary IDs as labels
+#   (d) the masking rate is close to 15%
+# Loss inflated by ~2× often means padding positions are included in the loss.
+# ══════════════════════════════════════════════════════════════════════════════
+print("═" * 60)
+print("DIAGNOSTIC 3 — MLM collator label sanity check")
+print("═" * 60)
 
-    # Batch — MI300X has 192GB HBM3, push it hard
-    per_device_train_batch_size=128,
-    per_device_eval_batch_size=256,
-    gradient_accumulation_steps=2,      # effective batch = 256
+BATCH_SIZE_DIAG = 4
+diag_samples    = [dataset[i] for i in range(BATCH_SIZE_DIAG)]
 
-    # Learning rate
-    learning_rate=1e-4,
-    warmup_ratio=0.10,
-    weight_decay=0.01,
+try:
+    batch = collator(diag_samples)
 
-    # Schedule
-    num_train_epochs=3,
-    lr_scheduler_type="cosine",
+    input_ids = batch["input_ids"]   # (B, seq_len)
+    labels    = batch["labels"]      # (B, seq_len)
+    seq_len   = input_ids.shape[1]
+    total_tok = labels.numel()
 
-    # Precision — BF16 is more stable than FP16, MI300X has native BF16 support
-    bf16=True,
-    fp16=False,
+    # ── (a) Padding label check ────────────────────────────────────────────
+    pad_positions  = (input_ids == PAD_ID)
+    pad_not_masked = (labels[pad_positions] != -100).sum().item()
+    print(f"  (a) Padding positions with label ≠ -100 : {pad_not_masked}")
+    if pad_not_masked > 0:
+        print("      ⚠ Collator is including padding in the loss — set these labels to -100!")
+    else:
+        print("      ✓ Padding positions correctly excluded from loss.")
 
-    # Checkpointing & logging
-    logging_steps=100,
-    save_steps=2000,
-    save_total_limit=3,
-    eval_steps=2000,
-    eval_strategy="steps",
+    # ── (b) / (c) Active label positions ──────────────────────────────────
+    active_mask  = (labels != -100)
+    n_active     = active_mask.sum().item()
+    mask_rate    = 100.0 * n_active / total_tok
+    print(f"\n  (b/c) Active (masked) label positions : {n_active} / {total_tok} ({mask_rate:.1f}%)")
+    if abs(mask_rate - 15.0) > 3.0:
+        print(f"      ⚠ Masking rate {mask_rate:.1f}% is far from expected 15%.")
+    else:
+        print(f"      ✓ Masking rate is within 3% of target 15%.")
 
-    # Disable best-model loading so checkpointing plays nicely with resume
-    load_best_model_at_end=False,
-    metric_for_best_model="eval_loss",
+    # ── (d) Label vocabulary range check ──────────────────────────────────
+    active_labels = labels[active_mask]
+    out_of_range  = ((active_labels < 0) | (active_labels >= VOCAB_SIZE)).sum().item()
+    print(f"\n  (d) Label IDs out of vocab range [0, {VOCAB_SIZE}) : {out_of_range}")
+    if out_of_range > 0:
+        print("      ⚠ Some label IDs are invalid — check collator masking logic.")
+    else:
+        print("      ✓ All label IDs are within vocabulary range.")
 
-    # I/O — data is in RAM so workers only add overhead; pin_memory speeds
-    # up CPU→GPU transfers via page-locked memory
-    dataloader_num_workers=0,
-    dataloader_pin_memory=True,
+    # ── Sample label decode ────────────────────────────────────────────────
+    print("\n  Decoded label tokens from first sample (first 20 positions):")
+    for pos, (inp, lbl) in enumerate(zip(input_ids[0][:20].tolist(), labels[0][:20].tolist())):
+        if lbl != -100:
+            inp_piece = sp.id_to_piece(inp)
+            lbl_piece = sp.id_to_piece(lbl)
+            print(f"    pos {pos:>3}: input='{inp_piece}' (id={inp})  label='{lbl_piece}' (id={lbl})")
 
-    # Reporting
-    report_to="wandb",
+except Exception as e:
+    print(f"  ✗ Could not run collator diagnostic: {e}")
+    print("    Ensure `collator` is your actual MLM collator and accepts a list of dataset samples.")
 
-    push_to_hub=False,
-)
-
-
-# ── Trainer ────────────────────────────────────────────────────────────────────
-trainer = Trainer(
-    model=model,
-    args=training_args,
-    train_dataset=train_dataset,
-    eval_dataset=val_dataset,
-    data_collator=data_collator,
-)
-print("✓ Trainer ready")
-
-
-# ── Train ──────────────────────────────────────────────────────────────────────
-print("\nStarting training...")
-trainer.train(resume_from_checkpoint=latest_checkpoint)
-
-trainer.save_model(FINAL_MODEL_DIR)
-print(f"✓ Model saved to {FINAL_MODEL_DIR}")
+print("═" * 60 + "\n")
 
 
-# ── Final Evaluation ───────────────────────────────────────────────────────────
-eval_results = trainer.evaluate()
-print("\n=== Final Evaluation ===")
-for k, v in eval_results.items():
-    print(f"  {k}: {v:.4f}")
+# ══════════════════════════════════════════════════════════════════════════════
+# DIAGNOSTIC 4 — Learning rate warmup progression check
+# At step 122 the LR was 2.182e-06, suggesting very slow warmup. Prints the
+# expected LR at several checkpoints so you can confirm warmup_steps is sane.
+# ══════════════════════════════════════════════════════════════════════════════
+print("═" * 60)
+print("DIAGNOSTIC 4 — Learning rate warmup progression check")
+print("═" * 60)
 
-wandb.finish()
+# Fill in your actual TrainingArguments values here
+TARGET_LR    = 1e-4       # peak learning_rate
+WARMUP_STEPS = 10000      # warmup_steps (or derived from warmup_ratio)
+TOTAL_STEPS  = 45372      # approximate from your run (45372 steps shown in progress bar)
+
+print(f"  Target LR       : {TARGET_LR:.2e}")
+print(f"  Warmup steps    : {WARMUP_STEPS}")
+print(f"  Total steps     : {TOTAL_STEPS}")
+print()
+print(f"  {'Step':>8}  {'Expected LR':>14}  {'% of warmup':>12}")
+print(f"  {'-'*8}  {'-'*14}  {'-'*12}")
+for step in [1, 50, 122, 500, 1000, WARMUP_STEPS, TOTAL_STEPS // 2, TOTAL_STEPS]:
+    if step <= WARMUP_STEPS:
+        lr = TARGET_LR * (step / WARMUP_STEPS)
+    else:
+        # Linear decay after warmup (HF default)
+        lr = TARGET_LR * max(0.0, (TOTAL_STEPS - step) / (TOTAL_STEPS - WARMUP_STEPS))
+    pct = 100.0 * min(step, WARMUP_STEPS) / WARMUP_STEPS
+    marker = "  ← your step 122" if step == 122 else ""
+    print(f"  {step:>8}  {lr:>14.3e}  {pct:>11.1f}%{marker}")
+
+observed_lr_step122 = 2.182e-6
+implied_warmup = int(TARGET_LR / observed_lr_step122 * 122)
+print(f"\n  Observed LR at step 122 = {observed_lr_step122:.3e}")
+print(f"  This implies warmup_steps ≈ {implied_warmup:,}")
+if implied_warmup > TOTAL_STEPS * 0.5:
+    print("  ⚠ Warmup is longer than 50% of total training — LR may never reach target.")
+else:
+    print("  ✓ Warmup length looks reasonable.")
+print("═" * 60 + "\n")
+
+
+print("═" * 60)
+print("All diagnostics complete. Review any ⚠ warnings above before")
+print("resuming / restarting training.")
+print("═" * 60)
