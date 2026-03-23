@@ -8,313 +8,295 @@ from transformers import (
     BertForMaskedLM,
     Trainer,
     TrainingArguments,
-    DataCollatorForLanguageModeling
 )
 import sentencepiece as spm
+from tqdm import tqdm
 import wandb
 
 
+# ── Config ─────────────────────────────────────────────────────────────────────
+TOKENIZER_MODEL    = "tokenizer/unigram_32000_0.9995.model"
+CHUNK_DIR          = "tokenized_chunks"
+CONFIG_FILE        = "bert_config.json"
+CHECKPOINT_DIR     = "bert_checkpoints"
+FINAL_MODEL_DIR    = "bert_final_model"
+WANDB_RUN_ID_FILE  = "wandb_run_id.txt"
 
-# ==================== CONFIGURATION ====================
-TOKENIZER_MODEL = "tokenizer/unigram_32000_0.9995.model"
-CHUNK_DIR = "tokenized_chunks"
-CONFIG_FILE = "bert_config.json"
-CHECKPOINT_DIR = "bert_checkpoints"
-WANDB_RUN_ID_FILE = "wandb_run_id.txt"  # File to store W&B run ID
+CACHE_FILES        = 10        # max .pt files held in memory at once
+MAX_FILES          = None      # set to int to cap dataset size for testing
+TRAIN_RATIO        = 0.9
 
-# Verify paths
-assert os.path.exists(TOKENIZER_MODEL)
-assert os.path.exists(CHUNK_DIR)
-assert os.path.exists(CONFIG_FILE)
+
+# ── Verify paths ───────────────────────────────────────────────────────────────
+assert os.path.exists(TOKENIZER_MODEL), f"Tokenizer not found: {TOKENIZER_MODEL}"
+assert os.path.exists(CHUNK_DIR),       f"Chunk dir not found: {CHUNK_DIR}"
+assert os.path.exists(CONFIG_FILE),     f"Config not found: {CONFIG_FILE}"
 print("✓ All paths verified")
 
 
-
-# ==================== TOKENIZER ====================
+# ── Tokenizer ──────────────────────────────────────────────────────────────────
 sp = spm.SentencePieceProcessor()
 sp.load(TOKENIZER_MODEL)
 
-PAD_ID = sp.pad_id()
+PAD_ID  = sp.pad_id()
 MASK_ID = sp.piece_to_id("[MASK]")
+VOCAB_SIZE = sp.get_piece_size()
 
-print("Vocab size:", sp.get_piece_size())
-print("PAD_ID:", PAD_ID)
-print("MASK_ID:", MASK_ID)
+print(f"Vocab size : {VOCAB_SIZE}")
+print(f"PAD_ID     : {PAD_ID}")
+print(f"MASK_ID    : {MASK_ID}")
 
 
-
-# ==================== DATASET ====================
+# ── Dataset (lazy loading with LRU file cache) ─────────────────────────────────
 class BertChunkDataset(Dataset):
     def __init__(self, chunk_dir, max_files=None):
         self.files = sorted(glob.glob(f"{chunk_dir}/*.pt"))
         if max_files:
             self.files = self.files[:max_files]
-        
-        assert len(self.files) > 0, "No chunk files found"
-        
-        # Load all data into memory
-        self.data = []
-        print(f"Loading {len(self.files)} files...")
-        for file_idx, file in enumerate(self.files):
-            if file_idx % 10 == 0:
-                print(f"  Loaded {file_idx}/{len(self.files)} files...")
-            file_data = torch.load(file)
-            self.data.extend(file_data)
-        
-        print(f"✓ Dataset loaded with {len(self.data)} samples")
-        random.shuffle(self.data)  # Shuffle once
+        assert len(self.files) > 0, f"No .pt files found in {chunk_dir}"
+
+        # Build index without loading all data into RAM
+        print(f"Indexing {len(self.files)} files...")
+        self.index = []   # list of (file_idx, sample_idx)
+        for file_idx, path in enumerate(tqdm(self.files, desc="Indexing")):
+            data = torch.load(path, weights_only=True)
+            self.index.extend((file_idx, i) for i in range(len(data)))
+
+        random.shuffle(self.index)
+        self._cache = {}   # file_idx → list[dict]
+        print(f"✓ Dataset indexed: {len(self.index):,} samples across {len(self.files)} files")
+
+    def _load(self, file_idx):
+        if file_idx not in self._cache:
+            # Evict oldest entry if cache is full
+            if len(self._cache) >= CACHE_FILES:
+                self._cache.pop(next(iter(self._cache)))
+            self._cache[file_idx] = torch.load(self.files[file_idx], weights_only=True)
+        return self._cache[file_idx]
 
     def __len__(self):
-        return len(self.data)
+        return len(self.index)
 
     def __getitem__(self, idx):
-        item = self.data[idx]
+        file_idx, sample_idx = self.index[idx]
+        item = self._load(file_idx)[sample_idx]
         return {
-            "input_ids": item["input_ids"],
-            "attention_mask": item["attention_mask"]
+            "input_ids":      item["input_ids"],
+            "attention_mask": item["attention_mask"],
         }
 
-# Initialize dataset with a limit for testing
-dataset = BertChunkDataset(CHUNK_DIR, max_files=800)  # Start with 20 files max_files=10
+
+dataset = BertChunkDataset(CHUNK_DIR, max_files=MAX_FILES)
 
 
-
-# ==================== DATA COLLATOR ====================
+# ── MLM Data Collator ──────────────────────────────────────────────────────────
 class SimpleMLMCollator:
+    """
+    Standard BERT MLM masking:
+      - 15% of non-padding tokens are selected
+      - Of those: 80% → [MASK], 10% → random token, 10% → unchanged
+    """
     def __init__(self, mask_token_id, pad_token_id, vocab_size, mlm_probability=0.15):
-        self.mask_token_id = mask_token_id
-        self.pad_token_id = pad_token_id
-        self.vocab_size = vocab_size
+        self.mask_token_id  = mask_token_id
+        self.pad_token_id   = pad_token_id
+        self.vocab_size     = vocab_size
         self.mlm_probability = mlm_probability
 
     def __call__(self, examples):
-        input_ids = torch.stack([e["input_ids"] for e in examples])
+        input_ids      = torch.stack([e["input_ids"]      for e in examples])
         attention_mask = torch.stack([e["attention_mask"] for e in examples])
 
         labels = input_ids.clone()
 
-        # Do not mask padding
+        # Select 15% of tokens, excluding padding
         probability_matrix = torch.full(labels.shape, self.mlm_probability)
         probability_matrix.masked_fill_(input_ids == self.pad_token_id, 0.0)
-
         masked_indices = torch.bernoulli(probability_matrix).bool()
+
+        # Unselected positions → -100 (ignored by cross-entropy loss)
         labels[~masked_indices] = -100
 
-        # 80% -> [MASK]
-        mask_replace_prob = 0.8
-        mask_replace = torch.bernoulli(torch.full(labels.shape, mask_replace_prob)).bool() & masked_indices
-        input_ids[mask_replace] = self.mask_token_id
-
-        # 10% -> random token (correct probability: 0.1 / 0.15 ≈ 0.6667)
-        random_replace_prob = 0.6667
-        random_replace = torch.bernoulli(torch.full(labels.shape, random_replace_prob)).bool() & masked_indices & ~mask_replace
-        random_tokens = torch.randint(
-            low=0,
-            high=self.vocab_size,
-            size=labels.shape,
-            dtype=torch.long
+        # 80% of selected → [MASK]
+        replace_with_mask = (
+            torch.bernoulli(torch.full(labels.shape, 0.8)).bool()
+            & masked_indices
         )
-        input_ids[random_replace] = random_tokens[random_replace]
+        input_ids[replace_with_mask] = self.mask_token_id
 
-        # 10% -> unchanged (already handled by not being masked or replaced)
+        # 10% of selected → random token
+        # (bernoulli(0.5) on the remaining 20% gives 10% overall)
+        replace_with_random = (
+            torch.bernoulli(torch.full(labels.shape, 0.5)).bool()
+            & masked_indices
+            & ~replace_with_mask
+        )
+        random_tokens = torch.randint(0, self.vocab_size, labels.shape, dtype=torch.long)
+        input_ids[replace_with_random] = random_tokens[replace_with_random]
+
+        # Remaining 10% of selected → unchanged (no action needed)
 
         return {
-            "input_ids": input_ids,
+            "input_ids":      input_ids,
             "attention_mask": attention_mask,
-            "labels": labels
+            "labels":         labels,
         }
+
 
 data_collator = SimpleMLMCollator(
     mask_token_id=MASK_ID,
     pad_token_id=PAD_ID,
-    vocab_size=sp.get_piece_size(),
-    mlm_probability=0.15
+    vocab_size=VOCAB_SIZE,
+    mlm_probability=0.15,
 )
-
-print("✓ Custom MLM collator ready")
-
+print("✓ MLM collator ready")
 
 
-# ==================== TEST BATCH ====================
-# Test with a small batch
-batch = [dataset[i] for i in range(4)]
-out = data_collator(batch)
-
-print("input_ids shape:", out["input_ids"].shape)
-print("labels shape:", out["labels"].shape)
-
-# Count masked tokens
-masked_tokens = (out["labels"] != -100).sum().item()
-total_tokens = out["labels"].numel()
-print(f"Masked tokens: {masked_tokens} ({masked_tokens/total_tokens:.1%} of all tokens)")
+# ── Sanity-check collator on a tiny batch ─────────────────────────────────────
+_batch = [dataset[i] for i in range(4)]
+_out   = data_collator(_batch)
+_masked = (_out["labels"] != -100).sum().item()
+_total  = _out["labels"].numel()
+print(f"Collator check — input shape: {_out['input_ids'].shape}, "
+      f"masked: {_masked}/{_total} ({_masked/_total:.1%})")
 
 
-
-# ==================== MODEL ====================
+# ── Model ──────────────────────────────────────────────────────────────────────
 config = BertConfig.from_json_file(CONFIG_FILE)
 
-# Check for existing checkpoints
-checkpoint_found = False
 latest_checkpoint = None
-
 if os.path.exists(CHECKPOINT_DIR):
-    # Look for checkpoint folders (checkpoint-*)
-    checkpoint_dirs = glob.glob(f"{CHECKPOINT_DIR}/checkpoint-*")
-    if checkpoint_dirs:
-        # Get the latest checkpoint by step number
-        checkpoint_dirs.sort(key=lambda x: int(x.split('-')[-1]))
-        latest_checkpoint = checkpoint_dirs[-1]
-        checkpoint_found = True
-        print(f"✓ Found checkpoint: {latest_checkpoint}")
+    ckpt_dirs = sorted(
+        glob.glob(f"{CHECKPOINT_DIR}/checkpoint-*"),
+        key=lambda x: int(x.split("-")[-1])
+    )
+    if ckpt_dirs:
+        latest_checkpoint = ckpt_dirs[-1]
 
-if checkpoint_found:
+if latest_checkpoint:
     print(f"✓ Resuming from checkpoint: {latest_checkpoint}")
     model = BertForMaskedLM.from_pretrained(latest_checkpoint)
 else:
     print("✓ Training from scratch")
     model = BertForMaskedLM(config)
 
-print(f"Model parameters: {model.num_parameters():,}")
-print(f"Hidden size: {config.hidden_size}")
-print(f"Num layers: {config.num_hidden_layers}")
-print(f"Num attention heads: {config.num_attention_heads}")
+print(f"Parameters         : {model.num_parameters():,}")
+print(f"Hidden size        : {config.hidden_size}")
+print(f"Layers             : {config.num_hidden_layers}")
+print(f"Attention heads    : {config.num_attention_heads}")
+print(f"Intermediate size  : {config.intermediate_size}")
 
 
-
-# ==================== DATA SPLIT ====================
-# Split dataset into train and validation
-train_ratio = 0.9
-train_size = int(train_ratio * len(dataset))
-val_size = len(dataset) - train_size
-
+# ── Train / Validation Split ───────────────────────────────────────────────────
+train_size = int(TRAIN_RATIO * len(dataset))
+val_size   = len(dataset) - train_size
 train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
-
-print(f"Train samples: {len(train_dataset)}")
-print(f"Validation samples: {len(val_dataset)}")
-
+print(f"Train samples : {len(train_dataset):,}")
+print(f"Val samples   : {len(val_dataset):,}")
 
 
-# ==================== WANDB ====================
-# Get or create W&B run ID
+# ── W&B ───────────────────────────────────────────────────────────────────────
 wandb_run_id = None
-
 if os.path.exists(WANDB_RUN_ID_FILE):
-    with open(WANDB_RUN_ID_FILE, 'r') as f:
+    with open(WANDB_RUN_ID_FILE) as f:
         wandb_run_id = f.read().strip()
-    print(f"✓ Found existing W&B run ID: {wandb_run_id}")
+    print(f"✓ Resuming W&B run: {wandb_run_id}")
 else:
     print("✓ Starting new W&B run")
 
-# Initialize W&B with resume capability
 if wandb.run is None:
     run = wandb.init(
         project="bert-pretraining",
-        name="bert_lr1e-4_bs256_cosine",
-        id=wandb_run_id,           # Use existing run ID if available
-        resume="allow",             # Allow resuming
+        name="bert-base-110M-512len",
+        id=wandb_run_id,
+        resume="allow",
         config={
-            "lr": 1e-4,
-            "effective_batch_size": 32 * 8,
-            "scheduler": "cosine",
-            "epochs": 2,
+            "model_params":       model.num_parameters(),
+            "hidden_size":        config.hidden_size,
+            "num_layers":         config.num_hidden_layers,
+            "num_heads":          config.num_attention_heads,
+            "intermediate_size":  config.intermediate_size,
+            "max_seq_len":        512,
+            "mlm_probability":    0.15,
+            "learning_rate":      1e-4,
+            "effective_batch":    128 * 2,   # per_device * accum
+            "warmup_ratio":       0.10,
+            "scheduler":          "cosine",
+            "epochs":             3,
+            "vocab_size":         VOCAB_SIZE,
         }
     )
-    
-    # Save the run ID for future resumptions
-    with open(WANDB_RUN_ID_FILE, 'w') as f:
+    with open(WANDB_RUN_ID_FILE, "w") as f:
         f.write(run.id)
     print(f"✓ W&B run ID saved: {run.id}")
 
 
-
-# ==================== TRAINING ARGS ====================
+# ── Training Arguments ────────────────────────────────────────────────────────
 training_args = TrainingArguments(
-    output_dir="bert_checkpoints",
-    overwrite_output_dir=False, # set to false to start from existing checkpoints
-    
-    # Batch sizes
-    per_device_train_batch_size=32,  # Reduced for stability
-    per_device_eval_batch_size=64,
-    gradient_accumulation_steps=8,    # Effective batch = 128
-    
+    output_dir=CHECKPOINT_DIR,
+    overwrite_output_dir=False,
+
+    # Batch — MI300X has 192GB HBM3, push it hard
+    per_device_train_batch_size=128,
+    per_device_eval_batch_size=256,
+    gradient_accumulation_steps=2,      # effective batch = 256
+
     # Learning rate
-    learning_rate=1e-4,  # Lower learning rate for BERT
-    warmup_ratio=0.05,
-    # warmup_steps=5000,
+    learning_rate=1e-4,
+    warmup_ratio=0.10,
     weight_decay=0.01,
-    
-    # Training schedule
-    num_train_epochs=2,
+
+    # Schedule
+    num_train_epochs=3,
     lr_scheduler_type="cosine",
-    
-    # Checkpointing
+
+    # Precision — BF16 is more stable than FP16, MI300X has native BF16 support
+    bf16=True,
+    fp16=False,
+
+    # Checkpointing & logging
     logging_steps=100,
-    eval_steps=7500,  # Added evaluation steps
     save_steps=2000,
     save_total_limit=3,
-    
-    # Evaluation
+    eval_steps=5000,
     eval_strategy="steps",
-    load_best_model_at_end=False, # disable for resuming
+
+    # Disable best-model loading so checkpointing plays nicely with resume
+    load_best_model_at_end=False,
     metric_for_best_model="eval_loss",
-    
-    # Optimization
-    fp16=True,
-    dataloader_num_workers=4,
-    
+
+    # I/O
+    dataloader_num_workers=8,
+
     # Reporting
-    report_to="wandb", # reporting to wandb
-    
-    no_cuda=False,
-    
-    # Push to hub (disabled by default)
-    push_to_hub=False
+    report_to="wandb",
+
+    push_to_hub=False,
 )
 
 
-
-# ==================== TRAINER ====================
+# ── Trainer ────────────────────────────────────────────────────────────────────
 trainer = Trainer(
     model=model,
     args=training_args,
     train_dataset=train_dataset,
     eval_dataset=val_dataset,
     data_collator=data_collator,
-    # Optional: compute metrics if needed
-    # compute_metrics=compute_metrics,
 )
-
-print("✓ Trainer ready with train/validation split")
-
+print("✓ Trainer ready")
 
 
-# ==================== TRAINING ====================
-print("Starting training...")
+# ── Train ──────────────────────────────────────────────────────────────────────
+print("\nStarting training...")
+trainer.train(resume_from_checkpoint=latest_checkpoint)
 
-# Check if we should resume from checkpoint
-resume_from_checkpoint = None
-if os.path.exists(CHECKPOINT_DIR):
-    checkpoint_dirs = glob.glob(f"{CHECKPOINT_DIR}/checkpoint-*")
-    if checkpoint_dirs:
-        # get the latest checkpoint by step number
-        checkpoint_dirs.sort(key=lambda x: int(x.split('-')[-1]))
-        resume_from_checkpoint = checkpoint_dirs[-1]
-        print(f"Resuming from: {resume_from_checkpoint}")
-
-trainer.train(resume_from_checkpoint=resume_from_checkpoint)
-
-# Save the final model
-trainer.save_model("bert_final_model")
-print("✓ Training complete and model saved")
+trainer.save_model(FINAL_MODEL_DIR)
+print(f"✓ Model saved to {FINAL_MODEL_DIR}")
 
 
-
-# ==================== EVALUATION ====================
-# Evaluate on validation set
+# ── Final Evaluation ───────────────────────────────────────────────────────────
 eval_results = trainer.evaluate()
-print("\n=== Final Evaluation Results ===")
-for key, value in eval_results.items():
-    print(f"{key}: {value:.4f}")
-    
-# Finish W&B run
+print("\n=== Final Evaluation ===")
+for k, v in eval_results.items():
+    print(f"  {k}: {v:.4f}")
+
 wandb.finish()
