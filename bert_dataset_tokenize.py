@@ -12,8 +12,8 @@ NUM_SHARDS      = 100
 TOKENIZER_MODEL = "tokenizer/unigram_32000_0.9995.model"
 OUT_DIR         = "tokenized_chunks"
 
-MAX_LEN         = 256
-STRIDE          = 128
+MAX_LEN         = 512   # doubled from 256 for BERT-base
+STRIDE          = 256   # 50% overlap
 CHUNK_SIZE      = 10_000  # windows per .pt file
 PARALLEL_SHARDS = 4
 
@@ -61,8 +61,11 @@ def tokenize_text_shard(shard_id):
     in_path = f"{SHARD_DIR}/shard_{shard_id}.txt"
 
     with open(in_path, "r", encoding="utf-8") as f:
-        for line in tqdm(f, desc=f"Shard {shard_id}"):
-            tokens = sp.encode(line.strip(), out_type=int)
+        for line in tqdm(f, desc=f"Shard {shard_id}", position=shard_id % PARALLEL_SHARDS):
+            line = line.strip()
+            if not line:
+                continue
+            tokens = sp.encode(line, out_type=int)
             tokens.append(EOS)
             buffer.extend(tokens)
 
@@ -81,12 +84,12 @@ def tokenize_text_shard(shard_id):
                     chunk.clear()
                     chunk_id += 1
 
-    # Flush remainder (pad to MAX_LEN)
+    # Flush remainder — pad to MAX_LEN if anything is left
     if buffer:
-        pad = MAX_LEN - len(buffer)
+        pad_len = MAX_LEN - len(buffer)
         chunk.append({
-            "input_ids":      torch.tensor(buffer + [PAD] * pad),
-            "attention_mask": torch.tensor([1] * len(buffer) + [0] * pad),
+            "input_ids":      torch.tensor(buffer + [PAD] * pad_len, dtype=torch.long),
+            "attention_mask": torch.tensor([1] * len(buffer) + [0] * pad_len, dtype=torch.long),
         })
 
     if chunk:
@@ -101,13 +104,30 @@ def tokenize_all_shards():
     os.makedirs(OUT_DIR, exist_ok=True)
 
     shard_ids = list(range(NUM_SHARDS))
+    total_chunks = 0
 
     for i in range(0, NUM_SHARDS, PARALLEL_SHARDS):
         batch = shard_ids[i : i + PARALLEL_SHARDS]
         with Pool(PARALLEL_SHARDS) as p:
             p.map(tokenize_text_shard, batch)
+        total_chunks += len(batch)
+        print(f"  Completed shards {i}–{i + len(batch) - 1}  ({total_chunks}/{NUM_SHARDS})")
 
-    print("✓ Tokenization complete")
+    # Report output stats
+    import glob
+    pt_files = glob.glob(f"{OUT_DIR}/*.pt")
+    print(f"\n✓ Tokenization complete")
+    print(f"  Output files : {len(pt_files):,}")
+    print(f"  Sequence len : {MAX_LEN}")
+    print(f"  Stride       : {STRIDE}")
+
+    # Estimate total samples
+    sample_count = 0
+    for f in pt_files[:5]:
+        sample_count += len(torch.load(f))
+    avg_per_file = sample_count / min(5, len(pt_files))
+    estimated_total = int(avg_per_file * len(pt_files))
+    print(f"  Est. samples : ~{estimated_total:,}")
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
