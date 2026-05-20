@@ -400,7 +400,7 @@ if wandb.run is None:
             "effective_batch":    256,
             "warmup_ratio":       0.10,
             "scheduler":          "cosine",
-            "epochs":             3,
+            "epochs":             6,
             "vocab_size":         VOCAB_SIZE,
             "pad_id":             PAD_ID,
             "bos_id (cls)":       BOS_ID,
@@ -431,7 +431,7 @@ training_args = TrainingArguments(
     weight_decay=0.01,
 
     # Schedule
-    num_train_epochs=3,
+    num_train_epochs=6,
     lr_scheduler_type="cosine",
 
     # Precision — BF16 is more stable than FP16, MI300X has native BF16 support
